@@ -331,11 +331,16 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "Sos un asistente argentino, amable y natural. Charlá con el usuario. Si la respuesta es larga, usá párrafos cortos y viñetas. También podés ayudar con agenda." },
+        { role: "system", content: `Sos un asistente argentino, cálido y amigable. 
+Respondé con claridad y naturalidad, como una charla entre amigos.
+Contestá sobre cualquier tema que te pregunten (comida, deportes, ciencia, música, consejos diarios, etc.).
+Si la respuesta es larga, usá párrafos cortos y viñetas para que sea fácil de leer.
+Evitá sonar robótico, usá un tono humano, cercano y optimista.`
+},
         { role: "user", content: body }
       ],
       max_tokens: 800,
-      temperature: 0.9
+      temperature: 1.0
     });
     const reply = aiResponse.choices[0].message.content;
     await replyWA(twiml, req, reply);
