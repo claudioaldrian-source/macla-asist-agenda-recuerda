@@ -10,60 +10,79 @@ const axios = require("axios");
 const cron = require("node-cron");
 const { v4: uuidv4 } = require("uuid");
 
-// --- Helpers: TTS con ElevenLabs + envío WA (texto + audio)
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
-
-async function makeTTS(text) {
-  try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
-    const resp = await axios.post(
-      url,
-      {
-        text,
-        model_id: "eleven_monolingual_v1",
-        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-      },
-      {
-        headers: {
-          "xi-api-key": process.env.ELEVEN_API_KEY,
-          "Content-Type": "application/json"
-        },
-        responseType: "arraybuffer"
-      }
-    );
-
-    const dir = path.join(__dirname, "tts");
-    fs.mkdirSync(dir, { recursive: true });
-    const fileName = `tts-${Date.now()}.mp3`;
-    fs.writeFileSync(path.join(dir, fileName), resp.data);
-
-    if (!process.env.PUBLIC_BASE_URL) return null; // si no hay dominio público, solo texto
-    return `${process.env.PUBLIC_BASE_URL}/tts/${fileName}`;
-  } catch (e) {
-    console.warn("TTS fail:", e.message);
-    return null;
-  }
-}
-
-async function sendTextAndTTS(to, text) {
-  const mediaUrl = await makeTTS(text);
-  const msg = { from: WHATSAPP_FROM, to, body: text };
-  if (mediaUrl) msg.mediaUrl = [mediaUrl];
-  await twilioClient.messages.create(msg);
-}
-
-// ---------- OpenAI
+// ---------- Clients
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ---------- Twilio
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM;
 
-// ---------- Persistencia
+// ---------- Persistencia simple (JSON)
 const DB_PATH = path.join(__dirname, "memory.json");
 let db = { users: {}, reminders: [] };
-try { if (fs.existsSync(DB_PATH)) db = JSON.parse(fs.readFileSync(DB_PATH, "utf8")); } catch {}
+try {
+  if (fs.existsSync(DB_PATH)) db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+} catch {}
 const saveDB = () => fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+
+// ---------- Helpers UI
+function splitForWhatsApp(text, maxLen = 1200) {
+  const parts = [];
+  let chunk = "";
+  for (const line of String(text).split("\n")) {
+    if ((chunk + "\n" + line).length > maxLen) {
+      if (chunk) parts.push(chunk);
+      chunk = line;
+    } else {
+      chunk = chunk ? chunk + "\n" + line : line;
+    }
+  }
+  if (chunk) parts.push(chunk);
+  return parts;
+}
+
+// --- generar TTS (OpenAI) y devolver ruta local /tts/archivo.mp3
+async function makeTTS(text) {
+  const mp3 = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "alloy",
+    input: text
+  });
+  const buffer = Buffer.from(await mp3.arrayBuffer());
+  const filename = `wa-${uuidv4()}.mp3`;
+  const outDir = path.join(__dirname, "tts");
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, filename), buffer);
+  return `/tts/${filename}`;
+}
+
+// --- responder por WhatsApp con texto (partido) y 1 audio adjunto
+async function replyWA(twiml, req, text) {
+  const parts = splitForWhatsApp(text);
+  let audioPath = null;
+  try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
+
+  parts.forEach((part, i) => {
+    const m = twiml.message(part);
+    if (i === 0 && audioPath) {
+      const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
+      m.media(publicUrl);
+    }
+  });
+}
+
+// --- envío directo (fuera del webhook) con texto + audio (usa PUBLIC_BASE_URL)
+async function sendTextAndTTSDirect(to, text) {
+  const base = process.env.PUBLIC_BASE_URL || null;
+  let mediaUrl = null;
+  try {
+    const local = await makeTTS(text); // "/tts/xx.mp3"
+    if (base) mediaUrl = `${base}${local}`;
+  } catch (e) {
+    console.warn("TTS (direct) fail:", e.message);
+  }
+  const payload = { from: WHATSAPP_FROM, to, body: text };
+  if (mediaUrl) payload.mediaUrl = [mediaUrl];
+  await twilioClient.messages.create(payload);
+}
 
 // ---------- Google OAuth / Calendar
 function getOAuth2Client() {
@@ -73,10 +92,38 @@ function getOAuth2Client() {
   return oAuth2Client;
 }
 
-// ---------- Crear evento Calendar (con failsafe de fechas)
+// --- detectar si el usuario escribió un año explícito o un día de semana
+const YEAR_RE = /\b20\d{2}\b/;
+const WEEKDAY_RE = /(lunes|martes|mi[eé]rcoles|jueves|viernes|s[áa]bado|domingo)/i;
+
+// --- normalizar la fecha al FUTURO CERCANO
+function normalizeToNearestFuture(startISO, originalText) {
+  let d = new Date(startISO);
+  if (isNaN(d.getTime())) return null;
+  const now = new Date();
+
+  const userPutYear = YEAR_RE.test(originalText);
+  const mentionsWeekday = WEEKDAY_RE.test(originalText);
+
+  // si quedó demasiado lejos (más de ~370 días) y el usuario NO escribió año,
+  // traelo hacia este año/previo, 1 ciclo como máximo
+  if (!userPutYear) {
+    while (d - now > 370 * 24 * 3600 * 1000) d.setFullYear(d.getFullYear() - 1);
+  }
+
+  if (d <= now) {
+    if (mentionsWeekday) {
+      while (d <= now) d = new Date(d.getTime() + 7 * 24 * 3600 * 1000);
+    } else {
+      while (d <= now) d.setFullYear(d.getFullYear() + 1);
+    }
+  }
+  return d.toISOString();
+}
+
+// ---------- Crear evento Calendar (con failsafe)
 async function createCalendarEvent({ summary, description, startISO, endISO, attendeesEmails = [] }) {
-  
-// failpad → si la fecha está en el pasado, la paso al futuro
+  // por las dudas, si vino pasado, empujá al futuro +1h
   let startDate = new Date(startISO);
   if (startDate.getTime() < Date.now()) {
     startDate.setFullYear(new Date().getFullYear() + 1);
@@ -101,7 +148,7 @@ async function createCalendarEvent({ summary, description, startISO, endISO, att
   return res.data;
 }
 
-// ----- Parser de intenciones (agenda, recordatorio, charla)
+// ----- Parser de intenciones
 async function classifyAndExtractIntent(userText) {
   const sys = `Sos un parser. Tu salida debe ser SOLO JSON válido:
 {
@@ -115,10 +162,10 @@ async function classifyAndExtractIntent(userText) {
 Reglas:
 - "agendar/reunión/turno/cita + fecha/hora" -> calendar_event
 - "recordame/recordatorio" sin fecha clara -> local_reminder
-- Si dice "hola", "buen día", preguntas comunes -> chitchat
-- Si hay hora pero dice "recordame", tratálo como calendar_event
-- Si falta endISO, usá +60 min
-- Fechas siempre deben ser futuras (si el día ya pasó este año, mover al año siguiente).`;
+- saludos/preguntas comunes -> chitchat
+- si dice "recordame" con hora precisa, tratálo como calendar_event
+- si falta endISO, usá +60 min
+- Fechas siempre futuras (si ya pasó este año, mover al siguiente).`;
 
   try {
     const c = await openai.chat.completions.create({
@@ -136,7 +183,7 @@ Reglas:
   }
 }
 
-// ---------- Recordatorio 1h antes
+// ---------- Recordatorio 1h antes (para eventos de Calendar)
 function scheduleReminder(eventId, eventSummary, startISO, minutesBefore, toWa) {
   if (!startISO || !toWa) return;
   const fireAt = new Date(new Date(startISO).getTime() - minutesBefore * 60 * 1000).getTime();
@@ -144,14 +191,12 @@ function scheduleReminder(eventId, eventSummary, startISO, minutesBefore, toWa) 
   if (delay <= 0) return;
   setTimeout(async () => {
     try {
-      await twilioClient.messages.create({
-        from: WHATSAPP_FROM, to: toWa, body: `⏰ Recordatorio: "${eventSummary}" en ${minutesBefore} minutos.`
-      });
+      await sendTextAndTTSDirect(toWa, `⏰ Recordatorio: "${eventSummary}" en ${minutesBefore} minutos.`);
     } catch (e) { console.error("WA reminder error:", e.message); }
   }, delay);
 }
 
-// ---------- Resumen diario
+// ---------- Resumen del día (24h)
 async function getDayDigestForUser(identity) {
   const auth = getOAuth2Client();
   const calendar = google.calendar({ version: "v3", auth });
@@ -171,8 +216,9 @@ async function getDayDigestForUser(identity) {
     if (items.length) {
       eventsText = items.map(e => {
         const startISO = e.start?.dateTime || e.start?.date || e.start;
-        const when = startISO ? new Date(startISO).toLocaleString("es-AR", { 
-          day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "(sin hora)";
+        const when = startISO
+          ? new Date(startISO).toLocaleString("es-AR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
+          : "(sin hora)";
         return `• ${when} — ${e.summary || "(Sin título)"}`;
       }).join("\n");
     }
@@ -182,7 +228,7 @@ async function getDayDigestForUser(identity) {
 
   const localRems = (db.reminders || []).filter(r => r.identity === identity && !r.done && r.dueAt <= in24h.getTime());
   const remsText = localRems.length
-    ? localRems.map(r => `• ${new Date(r.dueAt).toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit"})} — ${r.text}`).join("\n")
+    ? localRems.map(r => `• ${new Date(r.dueAt).toLocaleTimeString("es-AR", { hour:"2-digit", minute:"2-digit" })} — ${r.text}`).join("\n")
     : "• (Sin recordatorios locales)";
 
   return `📋 *Resumen del día*\n\n🗓️ *Eventos (próximas 24h)*:\n${eventsText}\n\n⏰ *Recordatorios locales*:\n${remsText}`;
@@ -193,12 +239,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use("/tts", express.static(path.join(__dirname, "tts")));
+app.use("/tts", express.static(path.join(__dirname, "tts"))); // servir MP3
 
-// Endpoint de salud
 app.get("/health", (_, res) => res.send("OK"));
 
-// ---------- WhatsApp webhook
+// OAuth: sacar refresh token
+app.get("/get_token", (req, res) => {
+  const o = getOAuth2Client();
+  const url = o.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/calendar"]
+  });
+  res.send(`<a href="${url}" target="_blank">Autorizar Google Calendar</a>`);
+});
+
+app.get("/oauth2callback", async (req, res) => {
+  if (!req.query.code) return res.send("Falta ?code");
+  try {
+    const { tokens } = await getOAuth2Client().getToken(req.query.code);
+    res.send(`<h3>Copiá este refresh_token y guardalo en Railway (GOOGLE_REFRESH_TOKEN):</h3><pre>${tokens.refresh_token || "Ya existe uno activo"}</pre>`);
+  } catch (e) {
+    res.send("Error: " + e.message);
+  }
+});
+
+// ---------- Webhook WhatsApp
 app.post("/webhook/whatsapp", async (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
@@ -208,7 +274,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
   db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
 
-  // Resumen manual (24hs)
+  // Resumen diario manual
   if (/^resumen/i.test(body)) {
     const digest = await getDayDigestForUser(from);
     await replyWA(twiml, req, digest);
@@ -218,14 +284,12 @@ app.post("/webhook/whatsapp", async (req, res) => {
   // Intent
   const intent = await classifyAndExtractIntent(body);
 
-  // ---- Evento de Calendar
+  // Evento de Calendar
   if (intent.intent === "calendar_event" && intent.startISO) {
     try {
-      // normalizar al futuro cercano
       const fixedStartISO = normalizeToNearestFuture(intent.startISO, body);
       if (!fixedStartISO) throw new Error("Fecha inválida");
 
-      // si vino endISO, lo corrimos por el mismo delta
       let fixedEndISO = intent.endISO || null;
       if (fixedEndISO) {
         const delta = new Date(fixedStartISO).getTime() - new Date(intent.startISO).getTime();
@@ -253,7 +317,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // ---- Recordatorio local (sin fecha precisa)
+  // Recordatorio local (sin fecha precisa)
   if (intent.intent === "local_reminder" && !intent.startISO) {
     const r = { id: `r_${Date.now()}`, identity: from, text: intent.summary || body, dueAt: Date.now() + 30*60*1000, done: false };
     db.reminders.push(r); saveDB();
@@ -261,13 +325,12 @@ app.post("/webhook/whatsapp", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // ---- Charla normal (chitchat) con estilo amable y párrafos cortos
+  // Charla normal
   try {
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content:
-          "Sos un asistente argentino, amable y natural. Podés charlar (saludos, clima, ideas). Cuando la respuesta sea larga, usá párrafos cortos y listas con viñetas." },
+        { role: "system", content: "Sos un asistente argentino, amable y natural. Charlá con el usuario. Si la respuesta es larga, usá párrafos cortos y viñetas. También podés ayudar con agenda." },
         { role: "user", content: body }
       ],
       max_tokens: 800,
@@ -282,118 +345,13 @@ app.post("/webhook/whatsapp", async (req, res) => {
   return res.type("text/xml").send(twiml.toString());
 });
 
-  // --- dividir mensajes largos para WhatsApp (máx ~1200 chars por bloque)
-function splitForWhatsApp(text, maxLen = 1200) {
-  const out = [];
-  let chunk = "";
-  for (const line of String(text).split("\n")) {
-    if ((chunk + "\n" + line).length > maxLen) {
-      if (chunk) out.push(chunk);
-      chunk = line;
-    } else {
-      chunk = chunk ? chunk + "\n" + line : line;
-    }
-  }
-  if (chunk) out.push(chunk);
-  return out;
-}
-
-// --- generar TTS (mp3) y devolver ruta pública (/tts/archivo.mp3)
-async function makeTTS(text) {
-  const mp3 = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice: "alloy",
-    input: text
-  });
-  const buffer = Buffer.from(await mp3.arrayBuffer());
-  const filename = `wa-${uuidv4()}.mp3`;
-  const outDir = path.join(__dirname, "tts");
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(path.join(outDir, filename), buffer);
-  return `/tts/${filename}`;
-}
-
-// --- responder por WhatsApp con texto (partido) y 1 audio adjunto
-async function replyWA(twiml, req, text) {
-  const parts = splitForWhatsApp(text);
-  let audioPath = null;
-  try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
-
-  parts.forEach((part, i) => {
-    const m = twiml.message(part);
-    if (i === 0 && audioPath) {
-      const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
-      m.media(publicUrl); // adjunto MP3 en el primer bloque
-    }
-  });
-}
-
-// --- detectar si el usuario escribió un año explícito o un día de semana
-const YEAR_RE = /\b20\d{2}\b/;
-const WEEKDAY_RE = /(lunes|martes|mi[eé]rcoles|jueves|viernes|s[áa]bado|domingo)/i;
-
-// --- normalizar la fecha al FUTURO CERCANO
-function normalizeToNearestFuture(startISO, originalText) {
-  let d = new Date(startISO);
-  if (isNaN(d.getTime())) return null;
-  const now = new Date();
-
-  const userPutYear = YEAR_RE.test(originalText);
-  const mentionsWeekday = WEEKDAY_RE.test(originalText);
-
-  // si quedó demasiado lejos (más de ~370 días) y el usuario NO escribió año,
-  // traemos al próximo año máximo 1 ciclo
-  if (!userPutYear) {
-    while (d - now > 370 * 24 * 3600 * 1000) d.setFullYear(d.getFullYear() - 1);
-  }
-
-  if (d <= now) {
-    if (mentionsWeekday) {
-      // si dijo "lunes", "martes"... corré de a semanas hasta el próximo
-      while (d <= now) d = new Date(d.getTime() + 7 * 24 * 3600 * 1000);
-    } else {
-      // si dio día/mes y ya pasó en este año -> pasalo al próximo año
-      while (d <= now) d.setFullYear(d.getFullYear() + 1);
-    }
-  }
-  return d.toISOString();
-}
-
-  // Recordatorio local
-  if (intent.intent === "local_reminder" && !intent.startISO) {
-    const r = { id: `r_${Date.now()}`, identity: from, text: intent.summary || body, dueAt: Date.now() + 30*60*1000, done: false };
-    db.reminders.push(r); saveDB();
-    twiml.message("📝 Listo, lo guardé como recordatorio. Si querés hora exacta: 'recordame hoy a las 21 ...'.");
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  // Conversación normal (chitchat)
-  try {
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Sos un asistente argentino, amable y natural. Podés charlar, responder saludos, clima, dudas, y también ayudar con agenda." },
-        { role: "user", content: body }
-      ],
-      max_tokens: 300,
-      temperature: 0.9
-    });
-    const reply = aiResponse.choices[0].message.content;
-    twiml.message(reply);
-  } catch (e) {
-    twiml.message("⚠️ Perdón, tuve un problema entendiendo tu mensaje.");
-  }
-
-  return res.type("text/xml").send(twiml.toString());
-});   // 👈 Este cierre es el que faltaba
-
 // ---------- Disparo de recordatorios locales (texto + audio)
 setInterval(async () => {
   const now = Date.now();
-  const due = db.reminders.filter(r => !r.done && r.dueAt <= now);
+  const due = (db.reminders || []).filter(r => !r.done && r.dueAt <= now);
   for (const r of due) {
     try {
-      await sendTextAndTTS(r.identity, `⏰ Recordatorio: ${r.text}`);
+      await sendTextAndTTSDirect(r.identity, `⏰ Recordatorio: ${r.text}`);
     } catch (e) {
       console.error("Recordatorio local WA error:", e.message);
     }
@@ -402,13 +360,13 @@ setInterval(async () => {
   if (due.length) saveDB();
 }, 5000);
 
-// ---------- Resumen diario 06:30
+// ---------- Resumen diario 06:30 AR
 cron.schedule("30 6 * * *", async () => {
   console.log("⏰ Enviando resumen diario (06:30)...");
   for (const id of Object.keys(db.users)) {
     try {
       const digest = await getDayDigestForUser(id);
-      await twilioClient.messages.create({ from: WHATSAPP_FROM, to: id, body: digest });
+      await sendTextAndTTSDirect(id, digest);
     } catch (e) {
       console.error("Resumen WA error:", id, e.message);
     }

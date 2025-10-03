@@ -16,5 +16,17 @@
     "openai": "^4.59.0",
     "twilio": "^4.22.0",
     "uuid": "^9.0.1"
-  }
+  },
+  "description": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/claudioaldrian-source/macla-asist-agenda-recuerda.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/claudioaldrian-source/macla-asist-agenda-recuerda/issues"
+  },
+  "homepage": "https://github.com/claudioaldrian-source/macla-asist-agenda-recuerda#readme"
 }
