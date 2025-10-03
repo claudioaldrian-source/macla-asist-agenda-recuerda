@@ -9,14 +9,14 @@ const { google } = require("googleapis");
 const axios = require("axios");
 const cron = require("node-cron");
 
-// ---------- OpenAI (parser de intenciones)
+// ---------- OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- Twilio
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM;
 
-// ---------- Persistencia simple
+// ---------- Persistencia
 const DB_PATH = path.join(__dirname, "memory.json");
 let db = { users: {}, reminders: [] };
 try { if (fs.existsSync(DB_PATH)) db = JSON.parse(fs.readFileSync(DB_PATH, "utf8")); } catch {}
@@ -30,9 +30,19 @@ function getOAuth2Client() {
   return oAuth2Client;
 }
 
+// ---------- Crear evento Calendar (con failsafe de fechas)
 async function createCalendarEvent({ summary, description, startISO, endISO, attendeesEmails = [] }) {
+  // failpad → si la fecha está en el pasado, la paso al futuro
+  let startDate = new Date(startISO);
+  if (startDate.getTime() < Date.now()) {
+    startDate.setFullYear(new Date().getFullYear() + 1);
+    startISO = startDate.toISOString();
+    endISO = new Date(startDate.getTime() + 60 * 60 * 1000).toISOString();
+  }
+
   const auth = getOAuth2Client();
   const calendar = google.calendar({ version: "v3", auth });
+
   const event = {
     summary: summary || "Evento",
     description: description || "",
@@ -41,25 +51,31 @@ async function createCalendarEvent({ summary, description, startISO, endISO, att
     attendees: (attendeesEmails || []).map(email => ({ email })),
     reminders: { useDefault: true }
   };
+
   const calendarId = process.env.GOOGLE_CALENDAR_ID || "primary";
   const res = await calendar.events.insert({ calendarId, requestBody: event });
   return res.data;
 }
 
+// ---------- Parser de intenciones (agenda, recordatorio, charla)
 async function classifyAndExtractIntent(userText) {
   const sys = `Sos un parser. Tu salida debe ser SOLO JSON válido:
 {
-  "intent": "calendar_event" | "local_reminder" | "none",
+  "intent": "calendar_event" | "local_reminder" | "chitchat" | "none",
   "summary": "string",
   "description": "string",
   "startISO": "YYYY-MM-DDTHH:mm:ssZ | ''",
   "endISO": "YYYY-MM-DDTHH:mm:ssZ | ''",
   "attendees": ["correo@ej.com", "..."]
 }
-Reglas: "agendar/reunión/turno/cita + fecha/hora" -> calendar_event. 
-"recordame/recordatorio" sin fecha clara -> local_reminder.
-Si hay hora pero dice "recordame", tratálo como calendar_event.
-Si falta endISO, usá +60 min.`;
+Reglas:
+- "agendar/reunión/turno/cita + fecha/hora" -> calendar_event
+- "recordame/recordatorio" sin fecha clara -> local_reminder
+- Si dice "hola", "buen día", preguntas comunes -> chitchat
+- Si hay hora pero dice "recordame", tratálo como calendar_event
+- Si falta endISO, usá +60 min
+- Fechas siempre deben ser futuras (si el día ya pasó este año, mover al año siguiente).`;
+
   try {
     const c = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -76,7 +92,7 @@ Si falta endISO, usá +60 min.`;
   }
 }
 
-// ---------- Recordatorio 1h antes de evento (push por WhatsApp)
+// ---------- Recordatorio 1h antes
 function scheduleReminder(eventId, eventSummary, startISO, minutesBefore, toWa) {
   if (!startISO || !toWa) return;
   const fireAt = new Date(new Date(startISO).getTime() - minutesBefore * 60 * 1000).getTime();
@@ -84,12 +100,14 @@ function scheduleReminder(eventId, eventSummary, startISO, minutesBefore, toWa) 
   if (delay <= 0) return;
   setTimeout(async () => {
     try {
-      await twilioClient.messages.create({ from: WHATSAPP_FROM, to: toWa, body: `⏰ Recordatorio: "${eventSummary}" en ${minutesBefore} minutos.` });
+      await twilioClient.messages.create({
+        from: WHATSAPP_FROM, to: toWa, body: `⏰ Recordatorio: "${eventSummary}" en ${minutesBefore} minutos.`
+      });
     } catch (e) { console.error("WA reminder error:", e.message); }
   }, delay);
 }
 
-// ---------- Resumen diario (24h)
+// ---------- Resumen diario
 async function getDayDigestForUser(identity) {
   const auth = getOAuth2Client();
   const calendar = google.calendar({ version: "v3", auth });
@@ -109,7 +127,8 @@ async function getDayDigestForUser(identity) {
     if (items.length) {
       eventsText = items.map(e => {
         const startISO = e.start?.dateTime || e.start?.date || e.start;
-        const when = startISO ? new Date(startISO).toLocaleString("es-AR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "(sin hora)";
+        const when = startISO ? new Date(startISO).toLocaleString("es-AR", { 
+          day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "(sin hora)";
         return `• ${when} — ${e.summary || "(Sin título)"}`;
       }).join("\n");
     }
@@ -117,7 +136,7 @@ async function getDayDigestForUser(identity) {
     eventsText = "• (No se pudo leer Calendar)";
   }
 
-  const localRems = (db.reminders || []).filter(r => r.identity === identity && !r.done && r.dueAt <= (now.getTime() + 24 * 60 * 60 * 1000));
+  const localRems = (db.reminders || []).filter(r => r.identity === identity && !r.done && r.dueAt <= in24h.getTime());
   const remsText = localRems.length
     ? localRems.map(r => `• ${new Date(r.dueAt).toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit"})} — ${r.text}`).join("\n")
     : "• (Sin recordatorios locales)";
@@ -131,25 +150,8 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// endpoint para probar que está vivo
+// Endpoint de salud
 app.get("/health", (_, res) => res.send("OK"));
-
-// OAuth helper para sacar refresh_token
-app.get("/get_token", (req, res) => {
-  const o = getOAuth2Client();
-  const url = o.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: ["https://www.googleapis.com/auth/calendar"] });
-  res.send(`<a href="${url}" target="_blank">Autorizar Google Calendar</a>`);
-});
-
-app.get("/oauth2callback", async (req, res) => {
-  if (!req.query.code) return res.send("Falta ?code");
-  try {
-    const { tokens } = await getOAuth2Client().getToken(req.query.code);
-    res.send(`<h3>Copiá este refresh_token y guardalo en Railway (GOOGLE_REFRESH_TOKEN):</h3><pre>${tokens.refresh_token || "Ya existe uno activo"}</pre>`);
-  } catch (e) {
-    res.send("Error: " + e.message);
-  }
-});
 
 // ---------- WhatsApp webhook
 app.post("/webhook/whatsapp", async (req, res) => {
@@ -161,14 +163,17 @@ app.post("/webhook/whatsapp", async (req, res) => {
   db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
 
+  // Resumen manual
   if (/^resumen/i.test(body)) {
     const digest = await getDayDigestForUser(from);
     twiml.message(digest);
     return res.type("text/xml").send(twiml.toString());
   }
 
+  // Intención
   const intent = await classifyAndExtractIntent(body);
 
+  // Evento Calendar
   if (intent.intent === "calendar_event" && intent.startISO) {
     try {
       const e = await createCalendarEvent({
@@ -179,7 +184,8 @@ app.post("/webhook/whatsapp", async (req, res) => {
         attendeesEmails: intent.attendees || []
       });
       scheduleReminder(e.id, e.summary, intent.startISO, 60, from);
-      const fecha = new Date(e.start.dateTime || e.start.date).toLocaleString("es-AR", { day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
+      const fecha = new Date(e.start.dateTime || e.start.date).toLocaleString("es-AR", { 
+        day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
       twiml.message(`✅ Agendado: *${e.summary}* el ${fecha}`);
     } catch (err) {
       twiml.message("⚠️ No pude crear el evento. Pasame fecha y hora claras (ej: 'jueves 10:00').");
@@ -187,6 +193,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
+  // Recordatorio local
   if (intent.intent === "local_reminder" && !intent.startISO) {
     const r = { id: `r_${Date.now()}`, identity: from, text: intent.summary || body, dueAt: Date.now() + 30*60*1000, done: false };
     db.reminders.push(r); saveDB();
@@ -194,11 +201,27 @@ app.post("/webhook/whatsapp", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  twiml.message("Puedo agendar eventos en Google Calendar, crear recordatorios y mandarte cada día a las 06:30 un resumen. Probá con: 'agendame reunión mañana 10:00' o 'recordame comprar pan'.");
+  // Conversación normal (chitchat)
+  try {
+    const aiResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Sos un asistente argentino, amable y natural. Podés charlar, responder saludos, clima, dudas, y también ayudar con agenda." },
+        { role: "user", content: body }
+      ],
+      max_tokens: 300,
+      temperature: 0.9
+    });
+    const reply = aiResponse.choices[0].message.content;
+    twiml.message(reply);
+  } catch (e) {
+    twiml.message("⚠️ Perdón, tuve un problema entendiendo tu mensaje.");
+  }
+
   return res.type("text/xml").send(twiml.toString());
 });
 
-// ---------- Disparo de recordatorios locales
+// ---------- Recordatorios locales
 setInterval(async () => {
   const now = Date.now();
   const due = db.reminders.filter(r => !r.done && r.dueAt <= now);
@@ -211,7 +234,7 @@ setInterval(async () => {
   if (due.length) saveDB();
 }, 5000);
 
-// ---------- Resumen diario 06:30 AR por WhatsApp
+// ---------- Resumen diario 06:30
 cron.schedule("30 6 * * *", async () => {
   console.log("⏰ Enviando resumen diario (06:30)...");
   for (const id of Object.keys(db.users)) {
