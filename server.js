@@ -10,7 +10,6 @@ const axios = require("axios");
 const cron = require("node-cron");
 
 // ---------- OpenAI (parser de intenciones)
-const { OpenAI } = require("openai");
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- Twilio
@@ -118,7 +117,6 @@ async function getDayDigestForUser(identity) {
     eventsText = "• (No se pudo leer Calendar)";
   }
 
-  // Recordatorios locales próximos (si usás db.reminders)
   const localRems = (db.reminders || []).filter(r => r.identity === identity && !r.done && r.dueAt <= (now.getTime() + 24 * 60 * 60 * 1000));
   const remsText = localRems.length
     ? localRems.map(r => `• ${new Date(r.dueAt).toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit"})} — ${r.text}`).join("\n")
@@ -130,20 +128,19 @@ async function getDayDigestForUser(identity) {
 // ---------- App
 const app = express();
 app.use(cors());
-
-// aceptar JSON y formularios
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // endpoint para probar que está vivo
 app.get("/health", (_, res) => res.send("OK"));
 
-// OAuth helper para sacar refresh_token (usá una vez)
+// OAuth helper para sacar refresh_token
 app.get("/get_token", (req, res) => {
   const o = getOAuth2Client();
   const url = o.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: ["https://www.googleapis.com/auth/calendar"] });
   res.send(`<a href="${url}" target="_blank">Autorizar Google Calendar</a>`);
 });
+
 app.get("/oauth2callback", async (req, res) => {
   if (!req.query.code) return res.send("Falta ?code");
   try {
@@ -159,19 +156,17 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
-  const from = req.body.From;                // whatsapp:+54...
+  const from = req.body.From;
   const body = (req.body.Body || "").trim();
-  db.users[from] = db.users[from] || { prefs: {} }; // registrar usuario
+  db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
 
-  // Pedidos rápidos
   if (/^resumen/i.test(body)) {
     const digest = await getDayDigestForUser(from);
     twiml.message(digest);
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Parsear intención
   const intent = await classifyAndExtractIntent(body);
 
   if (intent.intent === "calendar_event" && intent.startISO) {
@@ -183,7 +178,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
         endISO: intent.endISO,
         attendeesEmails: intent.attendees || []
       });
-      scheduleReminder(e.id, e.summary, intent.startISO, 60, from); // 1h antes
+      scheduleReminder(e.id, e.summary, intent.startISO, 60, from);
       const fecha = new Date(e.start.dateTime || e.start.date).toLocaleString("es-AR", { day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
       twiml.message(`✅ Agendado: *${e.summary}* el ${fecha}`);
     } catch (err) {
