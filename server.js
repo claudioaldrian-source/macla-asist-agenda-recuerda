@@ -130,8 +130,13 @@ async function getDayDigestForUser(identity) {
 // ---------- App
 const app = express();
 app.use(cors());
-app.use(express.urlencoded({ extended: false }));
-app.get("/health", (_, res) => res.send("OK")); // para chequear en Railway
+
+// aceptar JSON y formularios
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// endpoint para probar que está vivo
+app.get("/health", (_, res) => res.send("OK"));
 
 // OAuth helper para sacar refresh_token (usá una vez)
 app.get("/get_token", (req, res) => {
