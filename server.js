@@ -10,7 +10,7 @@ const axios = require("axios");
 const cron = require("node-cron");
 
 // ---------- OpenAI (parser de intenciones)
-const OpenAI = require("openai");
+const { OpenAI } = require("openai");
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- Twilio
