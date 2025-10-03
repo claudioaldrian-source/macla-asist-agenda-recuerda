@@ -61,7 +61,11 @@ async function replyWA(twiml, req, text) {
   try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
 
   parts.forEach((part, i) => {
-    const m = twiml.message(part);
+    // 👇 aseguramos que SIEMPRE haya texto en el mensaje
+    const m = twiml.message();
+    m.body(part);
+
+    // solo en el primer bloque agregamos también el audio
     if (i === 0 && audioPath) {
       const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
       m.media(publicUrl);
