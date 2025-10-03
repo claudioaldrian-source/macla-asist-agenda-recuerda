@@ -59,12 +59,14 @@ async function replyWA(twiml, req, text) {
   let audioPath = null;
   try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
 
-  // 👉 primer mensaje: texto + audio
-  const m = twiml.message();
-  m.body(text);
+  // 👉 primer mensaje: solo texto
+  twiml.message(text);
+
+  // 👉 segundo mensaje: solo audio (si existe)
   if (audioPath) {
     const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
-    m.media(publicUrl);
+    const m2 = twiml.message();
+    m2.media(publicUrl);
   }
 }
 
