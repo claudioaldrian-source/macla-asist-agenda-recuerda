@@ -10,6 +10,48 @@ const axios = require("axios");
 const cron = require("node-cron");
 const { v4: uuidv4 } = require("uuid");
 
+// --- Helpers: TTS con ElevenLabs + envío WA (texto + audio)
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+
+async function makeTTS(text) {
+  try {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+    const resp = await axios.post(
+      url,
+      {
+        text,
+        model_id: "eleven_monolingual_v1",
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+      },
+      {
+        headers: {
+          "xi-api-key": process.env.ELEVEN_API_KEY,
+          "Content-Type": "application/json"
+        },
+        responseType: "arraybuffer"
+      }
+    );
+
+    const dir = path.join(__dirname, "tts");
+    fs.mkdirSync(dir, { recursive: true });
+    const fileName = `tts-${Date.now()}.mp3`;
+    fs.writeFileSync(path.join(dir, fileName), resp.data);
+
+    if (!process.env.PUBLIC_BASE_URL) return null; // si no hay dominio público, solo texto
+    return `${process.env.PUBLIC_BASE_URL}/tts/${fileName}`;
+  } catch (e) {
+    console.warn("TTS fail:", e.message);
+    return null;
+  }
+}
+
+async function sendTextAndTTS(to, text) {
+  const mediaUrl = await makeTTS(text);
+  const msg = { from: WHATSAPP_FROM, to, body: text };
+  if (mediaUrl) msg.mediaUrl = [mediaUrl];
+  await twilioClient.messages.create(msg);
+}
+
 // ---------- OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -33,7 +75,8 @@ function getOAuth2Client() {
 
 // ---------- Crear evento Calendar (con failsafe de fechas)
 async function createCalendarEvent({ summary, description, startISO, endISO, attendeesEmails = [] }) {
-  // failpad → si la fecha está en el pasado, la paso al futuro
+  
+// failpad → si la fecha está en el pasado, la paso al futuro
   let startDate = new Date(startISO);
   if (startDate.getTime() < Date.now()) {
     startDate.setFullYear(new Date().getFullYear() + 1);
@@ -58,7 +101,7 @@ async function createCalendarEvent({ summary, description, startISO, endISO, att
   return res.data;
 }
 
-// ---------- Parser de intenciones (agenda, recordatorio, charla)
+// ----- Parser de intenciones (agenda, recordatorio, charla)
 async function classifyAndExtractIntent(userText) {
   const sys = `Sos un parser. Tu salida debe ser SOLO JSON válido:
 {
@@ -148,9 +191,9 @@ async function getDayDigestForUser(identity) {
 // ---------- App
 const app = express();
 app.use(cors());
-app.use("/tts", express.static(path.join(__dirname, "tts")));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use("/tts", express.static(path.join(__dirname, "tts")));
 
 // Endpoint de salud
 app.get("/health", (_, res) => res.send("OK"));
@@ -342,16 +385,18 @@ function normalizeToNearestFuture(startISO, originalText) {
   }
 
   return res.type("text/xml").send(twiml.toString());
-});
+});   // 👈 Este cierre es el que faltaba
 
-// ---------- Recordatorios locales
+// ---------- Disparo de recordatorios locales (texto + audio)
 setInterval(async () => {
   const now = Date.now();
   const due = db.reminders.filter(r => !r.done && r.dueAt <= now);
   for (const r of due) {
     try {
-      await twilioClient.messages.create({ from: WHATSAPP_FROM, to: r.identity, body: `⏰ Recordatorio: ${r.text}` });
-    } catch (e) { console.error("Recordatorio local WA error:", e.message); }
+      await sendTextAndTTS(r.identity, `⏰ Recordatorio: ${r.text}`);
+    } catch (e) {
+      console.error("Recordatorio local WA error:", e.message);
+    }
     r.done = true;
   }
   if (due.length) saveDB();
