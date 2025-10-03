@@ -8,6 +8,7 @@ const twilio = require("twilio");
 const { google } = require("googleapis");
 const axios = require("axios");
 const cron = require("node-cron");
+const { v4: uuidv4 } = require("uuid");
 
 // ---------- OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -147,6 +148,7 @@ async function getDayDigestForUser(identity) {
 // ---------- App
 const app = express();
 app.use(cors());
+app.use("/tts", express.static(path.join(__dirname, "tts")));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -163,35 +165,156 @@ app.post("/webhook/whatsapp", async (req, res) => {
   db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
 
-  // Resumen manual
+  // Resumen manual (24hs)
   if (/^resumen/i.test(body)) {
     const digest = await getDayDigestForUser(from);
-    twiml.message(digest);
+    await replyWA(twiml, req, digest);
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Intención
+  // Intent
   const intent = await classifyAndExtractIntent(body);
 
-  // Evento Calendar
+  // ---- Evento de Calendar
   if (intent.intent === "calendar_event" && intent.startISO) {
     try {
+      // normalizar al futuro cercano
+      const fixedStartISO = normalizeToNearestFuture(intent.startISO, body);
+      if (!fixedStartISO) throw new Error("Fecha inválida");
+
+      // si vino endISO, lo corrimos por el mismo delta
+      let fixedEndISO = intent.endISO || null;
+      if (fixedEndISO) {
+        const delta = new Date(fixedStartISO).getTime() - new Date(intent.startISO).getTime();
+        fixedEndISO = new Date(new Date(intent.endISO).getTime() + delta).toISOString();
+      }
+
       const e = await createCalendarEvent({
         summary: intent.summary || "Evento",
         description: intent.description || "Creado por asistente",
-        startISO: intent.startISO,
-        endISO: intent.endISO,
+        startISO: fixedStartISO,
+        endISO: fixedEndISO,
         attendeesEmails: intent.attendees || []
       });
-      scheduleReminder(e.id, e.summary, intent.startISO, 60, from);
-      const fecha = new Date(e.start.dateTime || e.start.date).toLocaleString("es-AR", { 
-        day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
-      twiml.message(`✅ Agendado: *${e.summary}* el ${fecha}`);
+
+      scheduleReminder(e.id, e.summary, fixedStartISO, 60, from);
+
+      const fecha = new Date(e.start.dateTime || e.start.date).toLocaleString("es-AR", {
+        day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit"
+      });
+
+      await replyWA(twiml, req, `✅ Agendado: *${e.summary}* el ${fecha}`);
     } catch (err) {
-      twiml.message("⚠️ No pude crear el evento. Pasame fecha y hora claras (ej: 'jueves 10:00').");
+      await replyWA(twiml, req, "⚠️ No pude crear el evento. Decime fecha y hora claras (ej: 'jueves 10:00').");
     }
     return res.type("text/xml").send(twiml.toString());
   }
+
+  // ---- Recordatorio local (sin fecha precisa)
+  if (intent.intent === "local_reminder" && !intent.startISO) {
+    const r = { id: `r_${Date.now()}`, identity: from, text: intent.summary || body, dueAt: Date.now() + 30*60*1000, done: false };
+    db.reminders.push(r); saveDB();
+    await replyWA(twiml, req, "📝 Listo, lo guardé como recordatorio. Si querés hora exacta: 'recordame hoy a las 21 ...'.");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  // ---- Charla normal (chitchat) con estilo amable y párrafos cortos
+  try {
+    const aiResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content:
+          "Sos un asistente argentino, amable y natural. Podés charlar (saludos, clima, ideas). Cuando la respuesta sea larga, usá párrafos cortos y listas con viñetas." },
+        { role: "user", content: body }
+      ],
+      max_tokens: 800,
+      temperature: 0.9
+    });
+    const reply = aiResponse.choices[0].message.content;
+    await replyWA(twiml, req, reply);
+  } catch (e) {
+    await replyWA(twiml, req, "⚠️ Perdón, tuve un problema entendiendo tu mensaje.");
+  }
+
+  return res.type("text/xml").send(twiml.toString());
+});
+
+  // --- dividir mensajes largos para WhatsApp (máx ~1200 chars por bloque)
+function splitForWhatsApp(text, maxLen = 1200) {
+  const out = [];
+  let chunk = "";
+  for (const line of String(text).split("\n")) {
+    if ((chunk + "\n" + line).length > maxLen) {
+      if (chunk) out.push(chunk);
+      chunk = line;
+    } else {
+      chunk = chunk ? chunk + "\n" + line : line;
+    }
+  }
+  if (chunk) out.push(chunk);
+  return out;
+}
+
+// --- generar TTS (mp3) y devolver ruta pública (/tts/archivo.mp3)
+async function makeTTS(text) {
+  const mp3 = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: "alloy",
+    input: text
+  });
+  const buffer = Buffer.from(await mp3.arrayBuffer());
+  const filename = `wa-${uuidv4()}.mp3`;
+  const outDir = path.join(__dirname, "tts");
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, filename), buffer);
+  return `/tts/${filename}`;
+}
+
+// --- responder por WhatsApp con texto (partido) y 1 audio adjunto
+async function replyWA(twiml, req, text) {
+  const parts = splitForWhatsApp(text);
+  let audioPath = null;
+  try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
+
+  parts.forEach((part, i) => {
+    const m = twiml.message(part);
+    if (i === 0 && audioPath) {
+      const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
+      m.media(publicUrl); // adjunto MP3 en el primer bloque
+    }
+  });
+}
+
+// --- detectar si el usuario escribió un año explícito o un día de semana
+const YEAR_RE = /\b20\d{2}\b/;
+const WEEKDAY_RE = /(lunes|martes|mi[eé]rcoles|jueves|viernes|s[áa]bado|domingo)/i;
+
+// --- normalizar la fecha al FUTURO CERCANO
+function normalizeToNearestFuture(startISO, originalText) {
+  let d = new Date(startISO);
+  if (isNaN(d.getTime())) return null;
+  const now = new Date();
+
+  const userPutYear = YEAR_RE.test(originalText);
+  const mentionsWeekday = WEEKDAY_RE.test(originalText);
+
+  // si quedó demasiado lejos (más de ~370 días) y el usuario NO escribió año,
+  // traemos al próximo año máximo 1 ciclo
+  if (!userPutYear) {
+    while (d - now > 370 * 24 * 3600 * 1000) d.setFullYear(d.getFullYear() - 1);
+  }
+
+  if (d <= now) {
+    if (mentionsWeekday) {
+      // si dijo "lunes", "martes"... corré de a semanas hasta el próximo
+      while (d <= now) d = new Date(d.getTime() + 7 * 24 * 3600 * 1000);
+    } else {
+      // si dio día/mes y ya pasó en este año -> pasalo al próximo año
+      while (d <= now) d.setFullYear(d.getFullYear() + 1);
+    }
+  }
+  return d.toISOString();
+}
 
   // Recordatorio local
   if (intent.intent === "local_reminder" && !intent.startISO) {
