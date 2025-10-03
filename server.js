@@ -60,13 +60,12 @@ async function replyWA(twiml, req, text) {
   try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
 
   // 👉 primer mensaje: texto + audio
-  const m = twiml.message();
-  m.body(text);
+  const m = twiml.message(text);  // Texto como parámetro directo
   if (audioPath) {
     const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
     m.media(publicUrl);
   }
-  }
+}
 
 // --- envío directo (fuera del webhook) con texto + audio (usa PUBLIC_BASE_URL)
 async function sendTextAndTTSDirect(to, text) {
