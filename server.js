@@ -271,7 +271,33 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const twiml = new MessagingResponse();
 
   const from = req.body.From;
-  const body = (req.body.Body || "").trim();
+  
+let body = (req.body.Body || "").trim();
+
+// 👉 Si el usuario mandó un audio de WhatsApp
+if (!body && req.body.NumMedia && req.body.MediaUrl0) {
+  const mediaUrl = req.body.MediaUrl0;
+  try {
+    // Descargar audio desde Twilio
+    const response = await axios.get(mediaUrl, { responseType: "arraybuffer" });
+    const buffer = Buffer.from(response.data);
+
+    // Transcribir con OpenAI
+    const transcription = await openai.audio.transcriptions.create({
+      file: buffer,
+      model: "whisper-1"   // también podés usar "gpt-4o-mini-transcribe"
+    });
+
+    body = transcription.text.trim();
+    console.log("📝 Transcripción del audio:", body);
+  } catch (e) {
+    console.error("Error transcribiendo audio:", e.message);
+  }
+}
+
+db.users[from] = db.users[from] || { prefs: {} };
+saveDB();
+
   db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
 
