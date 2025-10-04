@@ -452,14 +452,19 @@ app.post("/webhook/whatsapp", async (req, res) => {
   }
 
   // Verificar que hay contenido
-  if (!body) {
-    await replyWA(twiml, req, "No entendí tu mensaje.");
-    return res.type("text/xml").send(twiml.toString());
-  }
+if (!body || body.trim() === "") {
+  console.log("❌ Body vacío después de procesamiento");
+  await replyWA(twiml, req, "No entendí tu mensaje.");
+  return res.type("text/xml").send(twiml.toString());
+}
+
+console.log("✅ Body procesado:", body);
 
   // Guardar usuario
   db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
+  console.log("📝 Procesando mensaje:", body);
+  console.log("👤 Usuario:", from);
 
   // Comando: Resumen diario manual
   if (/^resumen/i.test(body)) {
