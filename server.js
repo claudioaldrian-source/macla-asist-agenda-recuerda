@@ -286,6 +286,8 @@ if (!body && req.body.NumMedia && req.body.MediaUrl0) {
 
     // Convertir buffer a stream legible (lo que OpenAI espera)
     const stream = Readable.from(buffer);
+   stream.path = "audio.ogg"; // 👈 nombre falso para que la API lo acepte
+
 
     // Transcribir con OpenAI Whisper
     const transcription = await openai.audio.transcriptions.create({
@@ -295,13 +297,20 @@ if (!body && req.body.NumMedia && req.body.MediaUrl0) {
 
     body = transcription.text.trim();
     console.log("📝 Transcripción del audio:", body);
+    console.log("📩 Payload Twilio:", req.body);
+    console.log("🎙️ Media URL:", mediaUrl);
+    console.log("📦 Tamaño del audio:", buffer.length);
+    console.log("📝 Transcripción del audio:", transcription.text);
   } catch (e) {
     console.error("Error transcribiendo audio:", e);
   }
 }
 
   // --- Asegurar que siempre haya algo
-  if (!body) body = "(mensaje vacío o no reconocido)";
+  if (!body || body === "(mensaje vacío o no reconocido)") {
+  await replyWA(twiml, req, "⚠️ No entendí tu audio, probá de nuevo más claro.");
+  return res.type("text/xml").send(twiml.toString());
+}
 
   // Guardar usuario
   db.users[from] = db.users[from] || { prefs: {} };
