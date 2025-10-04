@@ -92,19 +92,14 @@ async function makeTTS(text) {
 async function replyWA(twiml, req, text) {
   const parts = splitForWhatsApp(text);
   let audioPath = null;
-  
-  try {
-    audioPath = await makeTTS(text);
-  } catch (e) {
-    console.warn("TTS no disponible:", e.message);
-  }
+  try { audioPath = await makeTTS(text); } catch (e) { console.warn("TTS fail:", e.message); }
 
   parts.forEach((part, i) => {
-    const msg = twiml.message(part);
-    // Solo agregar audio al primer mensaje
+    const m = twiml.message();
+    m.body(part);
     if (i === 0 && audioPath) {
       const publicUrl = `${req.protocol}://${req.get("host")}${audioPath}`;
-      msg.media(publicUrl);
+      m.media(publicUrl);
     }
   });
 }
@@ -115,22 +110,25 @@ async function sendDirectWA(to, text) {
     const base = process.env.PUBLIC_BASE_URL || null;
     let mediaUrl = null;
     
-    if (base) {
-      const localPath = await makeTTS(text);
-      if (localPath) mediaUrl = `${base}${localPath}`;
+    try {
+      const local = await makeTTS(text); // "/tts/xx.mp3"
+      if (base) mediaUrl = `${base}${local}`;
+    } catch (e) {
+      console.warn("TTS (direct) fail:", e.message);
     }
     
-    const payload = {
-      from: WHATSAPP_FROM,
-      to,
-      body: text
+    const payload = { 
+      from: WHATSAPP_FROM, 
+      to, 
+      body: text 
     };
     
     if (mediaUrl) payload.mediaUrl = [mediaUrl];
     
     await twilioClient.messages.create(payload);
+    console.log("✅ Mensaje directo enviado a:", to);
   } catch (err) {
-    console.error("Error enviando WA directo:", err.message);
+    console.error("❌ Error enviando WA directo:", err.message);
   }
 }
 
