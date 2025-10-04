@@ -9,6 +9,7 @@ const { google } = require("googleapis");
 const axios = require("axios");
 const cron = require("node-cron");
 const { v4: uuidv4 } = require("uuid");
+const { Readable } = require("stream");
 
 // ---------- Clients
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -275,26 +276,29 @@ app.post("/webhook/whatsapp", async (req, res) => {
   // --- Texto recibido (si hay)
   let body = (req.body.Body || "").trim();
 
-  // --- Si el usuario mandó un audio de WhatsApp
-  if (!body && req.body.NumMedia && req.body.MediaUrl0) {
-    const mediaUrl = req.body.MediaUrl0;
-    try {
-      // Descargar audio desde Twilio
-      const response = await axios.get(mediaUrl, { responseType: "arraybuffer" });
-      const buffer = Buffer.from(response.data);
+ // --- Si el usuario mandó un audio de WhatsApp
+if (!body && req.body.NumMedia && req.body.MediaUrl0) {
+  const mediaUrl = req.body.MediaUrl0;
+  try {
+    // Descargar audio desde Twilio
+    const response = await axios.get(mediaUrl, { responseType: "arraybuffer" });
+    const buffer = Buffer.from(response.data);
 
-      // Transcribir con OpenAI
-      const transcription = await openai.audio.transcriptions.create({
-        file: buffer,
-        model: "whisper-1" // también podés probar "gpt-4o-mini-transcribe"
-      });
+    // Convertir buffer a stream legible (lo que OpenAI espera)
+    const stream = Readable.from(buffer);
 
-      body = transcription.text.trim();
-      console.log("📝 Transcripción del audio:", body);
-    } catch (e) {
-      console.error("Error transcribiendo audio:", e.message);
-    }
+    // Transcribir con OpenAI Whisper
+    const transcription = await openai.audio.transcriptions.create({
+      file: stream,
+      model: "whisper-1" // o "gpt-4o-mini-transcribe"
+    });
+
+    body = transcription.text.trim();
+    console.log("📝 Transcripción del audio:", body);
+  } catch (e) {
+    console.error("Error transcribiendo audio:", e);
   }
+}
 
   // --- Asegurar que siempre haya algo
   if (!body) body = "(mensaje vacío o no reconocido)";
