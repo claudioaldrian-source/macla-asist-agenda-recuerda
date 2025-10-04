@@ -9,6 +9,7 @@ const { google } = require("googleapis");
 const axios = require("axios");
 const cron = require("node-cron");
 const { v4: uuidv4 } = require("uuid");
+const { Readable } = require("stream");
 
 // ========================================
 // CLIENTES Y CONFIGURACIÓN
@@ -68,8 +69,8 @@ function splitForWhatsApp(text, maxLen = 1200) {
 async function makeTTS(text) {
   try {
     const mp3 = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: "nova",
+      model: "gpt-4o-mini-tts",
+      voice: "alloy",
       input: text.substring(0, 4096) // límite de OpenAI
     });
     
