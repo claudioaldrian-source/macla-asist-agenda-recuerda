@@ -271,48 +271,50 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const twiml = new MessagingResponse();
 
   const from = req.body.From;
-  
-let body = (req.body.Body || "").trim();
 
-// 👉 Si el usuario mandó un audio de WhatsApp
-if (!body && req.body.NumMedia && req.body.MediaUrl0) {
-  const mediaUrl = req.body.MediaUrl0;
-  try {
-    // Descargar audio desde Twilio
-    const response = await axios.get(mediaUrl, { responseType: "arraybuffer" });
-    const buffer = Buffer.from(response.data);
+  // --- Texto recibido (si hay)
+  let body = (req.body.Body || "").trim();
 
-    // Transcribir con OpenAI
-    const transcription = await openai.audio.transcriptions.create({
-      file: buffer,
-      model: "whisper-1"   // también podés usar "gpt-4o-mini-transcribe"
-    });
+  // --- Si el usuario mandó un audio de WhatsApp
+  if (!body && req.body.NumMedia && req.body.MediaUrl0) {
+    const mediaUrl = req.body.MediaUrl0;
+    try {
+      // Descargar audio desde Twilio
+      const response = await axios.get(mediaUrl, { responseType: "arraybuffer" });
+      const buffer = Buffer.from(response.data);
 
-    body = transcription.text.trim();
-    console.log("📝 Transcripción del audio:", body);
-  } catch (e) {
-    console.error("Error transcribiendo audio:", e.message);
+      // Transcribir con OpenAI
+      const transcription = await openai.audio.transcriptions.create({
+        file: buffer,
+        model: "whisper-1" // también podés probar "gpt-4o-mini-transcribe"
+      });
+
+      body = transcription.text.trim();
+      console.log("📝 Transcripción del audio:", body);
+    } catch (e) {
+      console.error("Error transcribiendo audio:", e.message);
+    }
   }
-}
 
-db.users[from] = db.users[from] || { prefs: {} };
-saveDB();
+  // --- Asegurar que siempre haya algo
+  if (!body) body = "(mensaje vacío o no reconocido)";
 
+  // Guardar usuario
   db.users[from] = db.users[from] || { prefs: {} };
   saveDB();
 
-  // Resumen diario manual
+  // --- Resumen diario manual
   if (/^resumen/i.test(body)) {
     const digest = await getDayDigestForUser(from);
     await replyWA(twiml, req, digest);
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Intent
+  // --- Detectar intención
   const intent = await classifyAndExtractIntent(body);
 
-  // Evento de Calendar
   if (intent.intent === "calendar_event" && intent.startISO) {
+    // --- Evento de Calendar
     try {
       const fixedStartISO = normalizeToNearestFuture(intent.startISO, body);
       if (!fixedStartISO) throw new Error("Fecha inválida");
@@ -341,37 +343,32 @@ saveDB();
     } catch (err) {
       await replyWA(twiml, req, "⚠️ No pude crear el evento. Decime fecha y hora claras (ej: 'jueves 10:00').");
     }
-    return res.type("text/xml").send(twiml.toString());
-  }
 
-  // Recordatorio local (sin fecha precisa)
-  if (intent.intent === "local_reminder" && !intent.startISO) {
+  } else if (intent.intent === "local_reminder" && !intent.startISO) {
+    // --- Recordatorio local
     const r = { id: `r_${Date.now()}`, identity: from, text: intent.summary || body, dueAt: Date.now() + 30*60*1000, done: false };
     db.reminders.push(r); saveDB();
     await replyWA(twiml, req, "📝 Listo, lo guardé como recordatorio. Si querés hora exacta: 'recordame hoy a las 21 ...'.");
-    return res.type("text/xml").send(twiml.toString());
-  }
 
-  // Charla normal
-  try {
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: `Sos un asistente argentino, cálido y amigable. 
-Respondé con claridad y naturalidad, como una charla entre amigos.
+  } else {
+    // --- Charla normal
+    try {
+      const aiResponse = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: `Sos un asistente argentino, cálido y amigable. Respondé con claridad y naturalidad, como una charla entre amigos.
 Contestá sobre cualquier tema que te pregunten (comida, deportes, ciencia, música, consejos diarios, etc.).
-Si la respuesta es larga, usá párrafos cortos y viñetas para que sea fácil de leer.
-Evitá sonar robótico, usá un tono humano, cercano y optimista.`
-},
-        { role: "user", content: body }
-      ],
-      max_tokens: 800,
-      temperature: 1.0
-    });
-    const reply = aiResponse.choices[0].message.content;
-    await replyWA(twiml, req, reply);
-  } catch (e) {
-    await replyWA(twiml, req, "⚠️ Perdón, tuve un problema entendiendo tu mensaje.");
+Si la respuesta es larga, usá párrafos cortos y viñetas. Evitá sonar robótico, usá un tono cercano y optimista.` },
+          { role: "user", content: body }
+        ],
+        max_tokens: 800,
+        temperature: 1.0
+      });
+      const reply = aiResponse.choices[0].message.content;
+      await replyWA(twiml, req, reply);
+    } catch (e) {
+      await replyWA(twiml, req, "⚠️ Perdón, tuve un problema entendiendo tu mensaje.");
+    }
   }
 
   return res.type("text/xml").send(twiml.toString());
